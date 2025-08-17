@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import * as tf from "@tensorflow/tfjs";
 import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
 import "@tensorflow/tfjs-backend-webgl";
+import { TRIANGULATION } from "./triangulation.js";
 import * as THREE from "three";
 
 const VIDEO_WIDTH = 640;
@@ -16,6 +17,7 @@ export default function FaceMeshViewer() {
   const rendererRef = useRef(null);
   const cameraRef = useRef(null);
   const glassesRef = useRef(null);
+  const faceOccluderRef = useRef(null);
   const [status, setStatus] = useState("Initializing...");
   const [isModelLoaded, setIsModelLoaded] = useState(false);
   const [isGlassesLoaded, setIsGlassesLoaded] = useState(false);
@@ -69,7 +71,8 @@ export default function FaceMeshViewer() {
         
         const renderer = new THREE.WebGLRenderer({ 
           alpha: true,
-          antialias: true 
+          antialias: true,
+          stencil: true  // Enable stencil buffer for occlusion
         });
         
         renderer.setSize(VIDEO_WIDTH, VIDEO_HEIGHT);
@@ -78,6 +81,10 @@ export default function FaceMeshViewer() {
         renderer.domElement.style.top = "0";
         renderer.domElement.style.left = "0";
         renderer.domElement.style.pointerEvents = "none";
+        
+        // Enable depth testing for proper occlusion
+        renderer.sortObjects = true;
+        renderer.shadowMap.enabled = false; // Disable shadows for performance
         
         if (threeContainerRef.current) {
           threeContainerRef.current.appendChild(renderer.domElement);
@@ -109,6 +116,69 @@ export default function FaceMeshViewer() {
       }
     }
 
+     function createFaceOccluder() {
+        if (!sceneRef.current) return;
+
+        console.log("Creating face occluder mesh for depth-based occlusion");
+
+        // Start with an empty geometry; it will be populated by the landmark detection
+        const occluderGeometry = new THREE.BufferGeometry();
+        
+        // The occluder material only needs to affect the depth buffer.
+        // It should be invisible.
+        const occluderMaterial = new THREE.MeshBasicMaterial({
+            color: 0x000000,
+            depthWrite: true,      // CRITICAL: Writes to the depth buffer
+            colorWrite: false,     // CRITICAL: Makes the material invisible
+        });
+        
+        const occluder = new THREE.Mesh(occluderGeometry, occluderMaterial);
+        occluder.renderOrder = -1; // Render this first!
+        occluder.visible = false;  // Start invisible until a face is detected
+        
+        sceneRef.current.add(occluder);
+        faceOccluderRef.current = occluder;
+
+        console.log("Face occluder ready for depth testing.");
+    }
+
+    function updateFaceOccluderFromLandmarks(landmarks) {
+        if (!faceOccluderRef.current || !landmarks || landmarks.length < 478) {
+             if(faceOccluderRef.current) faceOccluderRef.current.visible = false;
+             return;
+        }
+
+        try {
+            const vertices = [];
+            // Convert MediaPipe landmarks to 3D world coordinates
+            for (let i = 0; i < landmarks.length; i++) {
+                const landmark = landmarks[i];
+                const worldPos = uvToWorld(
+                    landmark.x / VIDEO_WIDTH, 
+                    landmark.y / VIDEO_HEIGHT,
+                    -0.2 // Place occluder slightly in front of glasses
+                );
+                vertices.push(worldPos.x, worldPos.y, worldPos.z);
+            }
+
+            const occluder = faceOccluderRef.current;
+            const geometry = occluder.geometry;
+
+            // Update vertices
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            
+            // Set the official triangulation indices
+            geometry.setIndex(TRIANGULATION);
+            
+            geometry.computeVertexNormals(); // Good practice for lighting calculations if it were visible
+            
+            occluder.visible = true;
+        } catch (error) {
+            console.warn("Failed to update face occluder from landmarks:", error);
+            if (faceOccluderRef.current) faceOccluderRef.current.visible = false;
+        }
+    }
+
     async function loadGlassesModel() {
       try {
         setStatus("Loading glasses model...");
@@ -124,31 +194,20 @@ export default function FaceMeshViewer() {
             (gltf) => {
               console.log("Glasses model loaded successfully");
               const glasses = gltf.scene;
+
+              // FIXED: Ensure glasses material uses depth testing to be occluded
               glasses.traverse((child) => {
                 if (child.isMesh) {
-                  // Ensure material is valid
-                  if (!(child.material && child.material.isMaterial)) {
-                    child.material = new THREE.MeshStandardMaterial({ color: 0xffffff });
-                  }
-                  child.castShadow = true;
-                  child.receiveShadow = true;
-                  
-                  // Ensure geometry has bounding sphere computed
-                  if (child.geometry && !child.geometry.boundingSphere) {
-                    child.geometry.computeBoundingSphere();
-                  }
-                  if (child.geometry && !child.geometry.boundingBox) {
-                    child.geometry.computeBoundingBox();
-                  }
+                  child.material.depthTest = true; // Ensure depth testing is on
+                  child.material.depthWrite = true;
                 }
               });
-              
-              // Scale and position the glasses appropriately
+
               glasses.scale.set(0.1, 0.1, 0.1);
-              glasses.position.set(0, 0, -0.3);
+              glasses.position.set(0, 0, 0); // Position is handled by alignment logic
               glasses.visible = true;
-              
-              // Add to scene
+              glasses.renderOrder = 0; // Render after the occluder
+
               if (sceneRef.current) {
                 sceneRef.current.add(glasses);
                 glassesRef.current = glasses;
@@ -199,11 +258,12 @@ export default function FaceMeshViewer() {
       // Position at origin for initial visibility
       cube.position.set(0, 0, -0.3);
       cube.visible = true;
+      cube.renderOrder = 1; // Render after occluder
       
       sceneRef.current.add(cube);
       glassesRef.current = cube;
       setIsGlassesLoaded(true);
-      setStatus("Using DEBUG CUBE (bright green)");
+      setStatus("Using DEBUG CUBE (bright green) with occlusion");
       
       console.log("Debug cube created at position:", cube.position);
     }
@@ -279,7 +339,7 @@ export default function FaceMeshViewer() {
         const u = normalizedGlassesCenter.x;              // if video is mirrored, use (1 - normalizedGlassesCenter.x)
         const v = normalizedGlassesCenter.y;
 
-        const targetZ = 0.0; // or -0.3 to sit a bit “into” the scene; adjust to taste
+        const targetZ = 0.0; // or -0.3 to sit a bit "into" the scene; adjust to taste
         const world = uvToWorld(u, v, targetZ);
 
         const position = { x: world.x, y: world.y, z: world.z };
@@ -340,67 +400,69 @@ export default function FaceMeshViewer() {
     }
 
     function updateGlassesAlignment(alignment) {
-  if (!glassesRef.current) {
-    console.log("No glasses reference found");
-    return;
-  }
+      if (!glassesRef.current) {
+        console.log("No glasses reference found");
+        return;
+      }
 
-  const { position, rotation, scale } = alignment;
+      const { position, rotation, scale } = alignment;
 
-  // Ensure glasses are visible
-  glassesRef.current.visible = true;
+      // Ensure glasses are visible
+      glassesRef.current.visible = true;
 
-  // Apply position directly
-  glassesRef.current.position.set(position.x, position.y, position.z);
+      // Apply position directly
+      glassesRef.current.position.set(position.x, position.y, position.z);
 
-  // Apply rotations directly
-  glassesRef.current.rotation.x = rotation.pitch;
-  glassesRef.current.rotation.y = rotation.yaw;
-  glassesRef.current.rotation.z = rotation.roll;
+      // Apply rotations directly
+      glassesRef.current.rotation.x = rotation.pitch;
+      glassesRef.current.rotation.y = rotation.yaw;
+      glassesRef.current.rotation.z = rotation.roll;
 
-  // Apply scale with bounds checking
-  const clampedScale = Math.max(0.1, Math.min(3.0, scale));
-  glassesRef.current.scale.setScalar(clampedScale);
+      // Apply scale with bounds checking
+      const clampedScale = Math.max(0.1, Math.min(3.0, scale));
+      glassesRef.current.scale.setScalar(clampedScale);
 
-  // Force update matrix
-  glassesRef.current.updateMatrix();
-  glassesRef.current.updateMatrixWorld(true);
+      // Force update matrix
+      glassesRef.current.updateMatrix();
+      glassesRef.current.updateMatrixWorld(true);
 
-  // Update debug info
-  setDebugInfo(
-    `Pos: (${position.x.toFixed(2)}, ${position.y.toFixed(2)}, ${position.z.toFixed(
-      2
-    )}) Scale: ${clampedScale.toFixed(2)}`
-  );
-
-  // Check if glasses are within camera frustum (for debugging)
-  if (cameraRef.current && glassesRef.current.geometry) {
-    try {
-      const frustum = new THREE.Frustum();
-      const matrix = new THREE.Matrix4().multiplyMatrices(
-        cameraRef.current.projectionMatrix,
-        cameraRef.current.matrixWorldInverse
+      // Update debug info
+      setDebugInfo(
+        `Pos: (${position.x.toFixed(2)}, ${position.y.toFixed(2)}, ${position.z.toFixed(
+          2
+        )}) Scale: ${clampedScale.toFixed(2)}`
       );
-      frustum.setFromProjectionMatrix(matrix);
 
-      if (!glassesRef.current.geometry.boundingSphere) {
-        glassesRef.current.geometry.computeBoundingSphere();
+      // Check if glasses are within camera frustum (for debugging)
+      if (cameraRef.current && glassesRef.current.geometry) {
+        try {
+          const frustum = new THREE.Frustum();
+          const matrix = new THREE.Matrix4().multiplyMatrices(
+            cameraRef.current.projectionMatrix,
+            cameraRef.current.matrixWorldInverse
+          );
+          frustum.setFromProjectionMatrix(matrix);
+
+          if (!glassesRef.current.geometry.boundingSphere) {
+            glassesRef.current.geometry.computeBoundingSphere();
+          }
+
+          const inFrustum = frustum.intersectsObject(glassesRef.current);
+          if (!inFrustum) {
+            console.warn("Glasses outside camera frustum!");
+          }
+        } catch (err) {
+          console.warn("Frustum check error:", err.message);
+        }
       }
 
-      const inFrustum = frustum.intersectsObject(glassesRef.current);
-      if (!inFrustum) {
-        console.warn("Glasses outside camera frustum!");
+      // Render the scene with proper depth testing for occlusion
+      if (rendererRef.current && sceneRef.current && cameraRef.current) {
+        // Clear depth buffer to ensure proper occlusion
+        rendererRef.current.clear(false, true, false);
+        rendererRef.current.render(sceneRef.current, cameraRef.current);
       }
-    } catch (err) {
-      console.warn("Frustum check error:", err.message);
     }
-  }
-
-  // Render the scene
-  if (rendererRef.current && sceneRef.current && cameraRef.current) {
-    rendererRef.current.render(sceneRef.current, cameraRef.current);
-  }
-}
 
     function getSimulatedAlignment() {
       const time = Date.now() * 0.001;
@@ -434,10 +496,18 @@ export default function FaceMeshViewer() {
             const face = predictions[0];
             if (face.keypoints && face.keypoints.length > 400) {
               alignment = getFaceAlignment(face.keypoints);
-              setStatus(`👓 Glasses aligned! Tracking ${predictions.length} face(s)`);
+              
+              // Update face occluder for proper depth-based occlusion
+              updateFaceOccluderFromLandmarks(face.keypoints);
+              
+              setStatus(`👓 Glasses aligned with occlusion! Tracking ${predictions.length} face(s)`);
             }
           } else {
             setStatus("👋 No face detected - show your face to the camera");
+            // Hide occluder when no face is detected
+            if (faceOccluderRef.current) {
+              faceOccluderRef.current.visible = false;
+            }
             alignment = {
               position: { x: 0, y: 0, z: -0.3 },
               rotation: { pitch: 0, yaw: 0, roll: 0 },
@@ -481,6 +551,9 @@ export default function FaceMeshViewer() {
         await initCamera();
         await initThreeJS();
         
+        // Create face occluder for depth-based occlusion
+        createFaceOccluder();
+        
         // Start animation loop immediately with simulation
         detectLoop();
         
@@ -500,7 +573,7 @@ export default function FaceMeshViewer() {
           await videoRef.current.play();
         }
         
-        console.log("Initialization complete");
+        console.log("Initialization complete with occlusion system");
       } catch (err) {
         console.error("Initialization error:", err);
         setStatus("Initialization failed");
@@ -519,6 +592,12 @@ export default function FaceMeshViewer() {
       }
       if (rendererRef.current) {
         rendererRef.current.dispose();
+      }
+      if (faceOccluderRef.current?.geometry) {
+        faceOccluderRef.current.geometry.dispose();
+      }
+      if (faceOccluderRef.current?.material) {
+        faceOccluderRef.current.material.dispose();
       }
     };
   }, []);
@@ -566,6 +645,7 @@ export default function FaceMeshViewer() {
       }}>
         <div>🕶️ Glasses: {isGlassesLoaded ? "✅" : "⏳"}</div>
         <div>🎯 Face Tracking: {isModelLoaded ? "✅" : "⏳"}</div>
+        <div>🚫 Occlusion: ✅ Active</div>
         <div>Status: {status}</div>
         {debugInfo && <div>Debug: {debugInfo}</div>}
       </div>
