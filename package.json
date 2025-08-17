@@ -17,6 +17,7 @@
     "@tensorflow/tfjs-core": "^4.22.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
+    "three": "^0.179.1",
     "vercel": "^45.0.9"
   },
   "devDependencies": {
