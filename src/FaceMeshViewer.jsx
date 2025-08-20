@@ -331,7 +331,7 @@ export default function FaceMeshViewer() {
         const normalizedGlassesCenter = {
           x: glassesCenter.x / VIDEO_WIDTH,   // Convert pixels to 0-1
           y: glassesCenter.y / VIDEO_HEIGHT - 0.02,  // Convert pixels to 0-1
-          z: glassesCenter.z / VIDEO_WIDTH    // Z uses same scale as X
+          z: glassesCenter.z / VIDEO_WIDTH   // Z uses same scale as X
         };
         
         console.log('Normalized coordinates:', normalizedGlassesCenter); // Debug log
@@ -339,7 +339,7 @@ export default function FaceMeshViewer() {
         const u = normalizedGlassesCenter.x;              // if video is mirrored, use (1 - normalizedGlassesCenter.x)
         const v = normalizedGlassesCenter.y;
 
-        const targetZ = 0.0; // or -0.3 to sit a bit "into" the scene; adjust to taste
+        const targetZ = -0.1; // or -0.3 to sit a bit "into" the scene; adjust to taste
         const world = uvToWorld(u, v, targetZ);
 
         const position = { x: world.x, y: world.y, z: world.z };
@@ -360,7 +360,7 @@ export default function FaceMeshViewer() {
         
         // Much more reasonable scale calculation based on normalized distance
         // Average eye distance is about 0.1-0.15 in normalized coordinates
-        const scale = Math.max(0.5, Math.min(3.0, eyeDistanceNormalized * 20));
+        const scale = Math.max(0.5, Math.min(4.0, eyeDistanceNormalized * 20));
 
         // Calculate rotations using normalized coordinates
         const eyeVectorPixels = {
@@ -377,7 +377,7 @@ export default function FaceMeshViewer() {
           y: (leftEyeCenter.y + rightEyeCenter.y) / 2
         };
         const noseOffsetPixels = noseTip.x - eyeMidpointPixels.x;
-        const yaw = Math.atan2(noseOffsetPixels, eyeDistancePixels) * 1.2;
+        const yaw = Math.atan2(noseOffsetPixels, eyeDistancePixels) * 0.8;
 
         // Pitch (head nod) - using nose tip relative to eye level
         const noseOffsetY = noseTip.y - eyeMidpointPixels.y;
@@ -419,7 +419,7 @@ export default function FaceMeshViewer() {
       glassesRef.current.rotation.z = rotation.roll;
 
       // Apply scale with bounds checking
-      const clampedScale = Math.max(0.1, Math.min(3.0, scale));
+      const clampedScale = Math.max(0.1, Math.min(4.0, scale));
       glassesRef.current.scale.setScalar(clampedScale);
 
       // Force update matrix
