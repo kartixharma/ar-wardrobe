@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import FaceMeshViewer from "./FaceMeshViewer";
 import GeminiAgentController from "./GeminiAgentController";
-import BodyMeshViewer from "./MotionCapture";
+
 
 // Accessory type definitions with their specific configurations
 const ACCESSORY_TYPES = {
