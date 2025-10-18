@@ -1,428 +1,855 @@
 import React, { useEffect, useRef, useState } from "react";
-import * as tf from "@tensorflow/tfjs";
-import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
-import "@tensorflow/tfjs-backend-webgl";
-import { TRIANGULATION } from "./triangulation.js";
 import * as THREE from "three";
+import { FACEMESH_TRIANGULATION } from "./triangulation";
+
+// MediaPipe Holistic + Camera utils
+import { Holistic } from "@mediapipe/holistic";
+import { Camera } from "@mediapipe/camera_utils";
 
 const VIDEO_WIDTH = 720;
 const VIDEO_HEIGHT = 620;
 
-// Face mesh regions for realistic occlusion
-const FACE_OCCLUDER_LANDMARKS = {
-  faceContour: [
-    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
-    397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
-    172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
-  ],
-  leftEye: [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246],
-  rightEye: [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398],
-  nose: [1, 2, 5, 4, 6, 168, 8, 9, 10, 151, 195, 197, 196, 3, 51, 48, 115, 131, 134, 102, 49],
-  forehead: [10, 151, 9, 337, 299, 333, 298, 301, 284, 251]
+// Accessory type constants
+const ACCESSORY_TYPES = {
+  GLASSES: "glasses",
+  EARRINGS: "earrings",
+  NECKLACE: "necklace",
+  T_SHIRT: "t-shirt",
 };
 
-export default function FaceMeshViewer({ glassesModelPath, setDebugInfo, setIsGlassesLoaded, setIsModelLoaded, setStatus }) {
-  const videoRef = useRef(null);
-  const threeContainerRef = useRef(null);
-  const animationRef = useRef(null);
-  const detectorRef = useRef(null);
-  const sceneRef = useRef(null);
-  const rendererRef = useRef(null);
-  const cameraRef = useRef(null);
-  const glassesRef = useRef(null);
-  const faceOccluderRef = useRef(null);
+// Smoothing factors for different properties
+const SMOOTHING = {
+  position: 0.3,
+  scale: 0.3,
+  rotation: 0.4,
+};
+
+let lastTShirtAlignment = null;
+
+/**
+ * Performs a shortest-path linear interpolation between two angles.
+ * @param {number} a The start angle in radians.
+ * @param {number} b The end angle in radians.
+ * @param {number} t The interpolation factor (0.0 to 1.0).
+ * @returns {number} The interpolated angle in radians.
+ */
+function lerpShortestAngle(a, b, t) {
+  const diff = (b - a) % (Math.PI * 2);
+  const shortestDiff = 2 * diff % (Math.PI * 2) - diff;
+  return a + shortestDiff * t;
+}
+// Key landmark indices for different accessory types (MediaPipe face mesh indices)
+const LANDMARK_INDICES = {
+  leftEyeCenter: 159,
+  rightEyeCenter: 386,
+  noseTip: 1,
+  leftEarLobe: 234, // Left ear lobe
+  rightEarLobe: 454, // Right ear lobe
+  leftEarTop: 127, // Top of left ear
+  rightEarTop: 356, // Top of right ear
+  chinBottom: 152, // Bottom center of the chin
+  leftJaw: 213, // Left jawline point
+  rightJaw: 433, // Right jawline point
+};
+
+// Helper: convert MediaPipe normalized landmarks to pixel-like points used by your alignment functions
+function convertFaceLandmarksToPixelPoints(faceLandmarks) {
+  if (!faceLandmarks || !faceLandmarks.length) return null;
+  // MediaPipe faceLandmarks provides normalized x,y (0..1) and z (approx - to + where scale is relative).
+  // Convert to same coordinate expectation used previously: x,y in pixels, z scaled similar to width.
+  return faceLandmarks.map((lm) => ({
+    x: lm.x * VIDEO_WIDTH,
+    y: lm.y * VIDEO_HEIGHT,
+    z: lm.z * VIDEO_WIDTH, // keep z scaled similar to width units
+  }));
+}
+
+// Helper: convert pose landmarks to pixel points
+function convertPoseLandmarksToPixelPoints(poseLandmarks) {
+  if (!poseLandmarks || !poseLandmarks.length) return null;
+  return poseLandmarks.map((lm) => ({
+    x: lm.x * VIDEO_WIDTH,
+    y: lm.y * VIDEO_HEIGHT,
+    z: lm.z * VIDEO_WIDTH,
+  }));
+}
+
+/**
+ * Accessory Alignment Strategies
+ * Each accessory type has its own calculation method
+ * NOTE: These expect `landmarks` in pixel-space like convertFaceLandmarksToPixelPoints outputs.
+ */
+const AccessoryAlignmentStrategies = {
+  [ACCESSORY_TYPES.GLASSES]: (landmarks, uvToWorld) => {
+    const leftEye = landmarks[LANDMARK_INDICES.leftEyeCenter];
+    const rightEye = landmarks[LANDMARK_INDICES.rightEyeCenter];
+    const noseTip = landmarks[LANDMARK_INDICES.noseTip];
+
+    if (!leftEye || !rightEye || !noseTip) return { visible: false };
+
+    // Calculate glasses center (between eyes, slightly above)
+    const glassesCenter = {
+      x: (leftEye.x + rightEye.x) / 2,
+      y: (leftEye.y + rightEye.y) / 2 + 0.01 * VIDEO_HEIGHT,
+      z: (leftEye.z + rightEye.z) / 2 - 0.05 * VIDEO_WIDTH,
+    };
+
+    // Normalize to UV coordinates (0..1)
+    const normalizedCenter = {
+      x: glassesCenter.x / VIDEO_WIDTH,
+      y: glassesCenter.y / VIDEO_HEIGHT - 0.02,
+      z: glassesCenter.z / VIDEO_WIDTH,
+    };
+
+    // Convert to world position
+    const targetZ = -0.1;
+    const world = uvToWorld(normalizedCenter.x, normalizedCenter.y, targetZ);
+    const position = { x: world.x, y: world.y, z: world.z };
+
+    // Calculate scale based on eye distance
+    const eyeDistancePixels = Math.sqrt(
+      Math.pow(rightEye.x - leftEye.x, 2) + Math.pow(rightEye.y - leftEye.y, 2) + Math.pow(rightEye.z - leftEye.z, 2)
+    );
+    const eyeDistanceNormalized = eyeDistancePixels / VIDEO_WIDTH;
+    const scale = Math.max(0.5, Math.min(4.0, eyeDistanceNormalized * 20));
+
+    // Calculate rotation (roll, yaw, pitch)
+    const eyeVector = {
+      x: rightEye.x - leftEye.x,
+      y: rightEye.y - leftEye.y,
+    };
+    const roll = -Math.atan2(eyeVector.y, eyeVector.x);
+
+    const eyeMidpoint = {
+      x: (leftEye.x + rightEye.x) / 2,
+      y: (leftEye.y + rightEye.y) / 2,
+    };
+    const noseOffsetX = noseTip.x - eyeMidpoint.x;
+    const yaw = Math.atan2(noseOffsetX, eyeDistancePixels) * 0.8;
+
+    const noseOffsetY = noseTip.y - eyeMidpoint.y;
+    const pitch = Math.atan2(noseOffsetY, eyeDistancePixels * 0.8) - 0.8;
+
+    return {
+      position,
+      rotation: { pitch, yaw, roll },
+      scale,
+      visible: true,
+    };
+  },
+
+  [ACCESSORY_TYPES.EARRINGS]: (landmarks, uvToWorld) => {
+    function averagePoints(landmarks, indices) {
+      const pts = indices.map((i) => landmarks[i]).filter(Boolean);
+      if (pts.length === 0) return null;
+      const avg = pts.reduce(
+        (acc, p) => ({
+          x: acc.x + p.x,
+          y: acc.y + p.y,
+          z: acc.z + p.z,
+        }),
+        { x: 0, y: 0, z: 0 }
+      );
+      const n = pts.length;
+      return { x: avg.x / n, y: avg.y / n, z: avg.z / n };
+    }
+
+    const leftEarLobe = averagePoints(landmarks, [234, 93, 132, 127]);
+    const rightEarLobe = averagePoints(landmarks, [454, 323, 361, 356]);
+    const leftEyeCenter = landmarks[LANDMARK_INDICES.leftEyeCenter];
+    const rightEyeCenter = landmarks[LANDMARK_INDICES.rightEyeCenter];
+
+    if (!leftEarLobe || !rightEarLobe || !leftEyeCenter || !rightEyeCenter) {
+      return { visible: false };
+    }
+
+    // Pixel -> normalized UV
+    const leftEarringPos = {
+      x: leftEarLobe.x / VIDEO_WIDTH - 0.009,
+      y: leftEarLobe.y / VIDEO_HEIGHT + 0.04,
+      z: leftEarLobe.z / VIDEO_WIDTH,
+    };
+
+    const rightEarringPos = {
+      x: rightEarLobe.x / VIDEO_WIDTH + 0.009,
+      y: rightEarLobe.y / VIDEO_HEIGHT + 0.04,
+      z: rightEarLobe.z / VIDEO_WIDTH,
+    };
+
+    // Convert to world coordinates
+    const leftWorld = uvToWorld(leftEarringPos.x, leftEarringPos.y, -0.25);
+    const rightWorld = uvToWorld(rightEarringPos.x, rightEarringPos.y, -0.25);
+
+    // Calculate scale using eye distance
+    const eyeDistance = Math.sqrt(
+      Math.pow(rightEyeCenter.x - leftEyeCenter.x, 2) + Math.pow(rightEyeCenter.y - leftEyeCenter.y, 2)
+    );
+    const scale = Math.max(0.3, Math.min(3.0, (eyeDistance / VIDEO_WIDTH) * 12));
+
+    const eyeVector = {
+      x: rightEyeCenter.x - leftEyeCenter.x,
+      y: rightEyeCenter.y - leftEyeCenter.y,
+    };
+    const roll = -Math.atan2(eyeVector.y, eyeVector.x);
+
+    return {
+      positions: [
+        { x: leftWorld.x, y: leftWorld.y, z: leftWorld.z },
+        { x: rightWorld.x, y: rightWorld.y, z: rightWorld.z },
+      ],
+      rotation: { pitch: 0, yaw: 0, roll },
+      scale,
+      visible: true,
+      isMultiple: true,
+    };
+  },
+[ACCESSORY_TYPES.NECKLACE]: (landmarks, uvToWorld) => {
+  // This strategy now expects RAW, NORMALIZED pose landmarks (0-1 range)
+  const leftShoulder = landmarks[11];
+  const rightShoulder = landmarks[12];
+
+  if (!leftShoulder || !rightShoulder) return { visible: false };
+
+  // Calculate center and apply a slight vertical offset
+  const centerX = (leftShoulder.x + rightShoulder.x) / 2;
+  const centerY = (leftShoulder.y + rightShoulder.y) / 2 - 0.06; // Offset up
+  const centerZ = (leftShoulder.z + rightShoulder.z) / 2;
+
+  // Convert normalized UV coordinates to world coordinates
+  const world = uvToWorld(centerX, centerY, centerZ);
+
+  // Scale based on shoulder distance in normalized coordinates
+  const shoulderDist = Math.sqrt(
+    Math.pow(rightShoulder.x - leftShoulder.x, 2) +
+    Math.pow(rightShoulder.y - leftShoulder.y, 2) 
+  );
+  const scale = Math.max(0.1, Math.min(4.0, shoulderDist * 6));
+
+  console.log("🟢 Necklace Debug:", {
+    normalized: { x: centerX.toFixed(3), y: centerY.toFixed(3), z: centerZ.toFixed(3) },
+    world: { x: world.x.toFixed(3), y: world.y.toFixed(3), z: world.z.toFixed(3) },
+    scale: scale.toFixed(2),
+  });
+
+  return {
+    position: { x: world.x, y: world.y, z: world.z },
+    rotation: { pitch: 0, yaw: 0, roll: 0 },
+    scale,
+    visible: true,
+  };
+},
+
+[ACCESSORY_TYPES.T_SHIRT]: (landmarks, uvToWorld) => {
+    // This strategy uses NORMALIZED pose landmarks
+    const leftShoulder = landmarks[11];
+    const rightShoulder = landmarks[12];
+    const leftHip = landmarks[23];
+    const rightHip = landmarks[24];
+
+    if (!leftShoulder || !rightShoulder || !leftHip || !rightHip) {
+      return { visible: false };
+    }
+
+    const shoulderVec = {
+  x: rightShoulder.x - leftShoulder.x,
+  y: rightShoulder.y - leftShoulder.y,
+  z: rightShoulder.z - leftShoulder.z,
+};
+
+    // --- Position Calculation ---
+    // Position: Center of the torso
+    const shoulderCenter = {
+      x: (leftShoulder.x + rightShoulder.x) / 2,
+      y: (leftShoulder.y + rightShoulder.y) / 2,
+      z: (leftShoulder.z + rightShoulder.z) / 2,
+    };
+    const hipCenter = {
+      x: (leftHip.x + rightHip.x) / 2,
+      y: (leftHip.y + rightHip.y) / 2,
+      z: (leftHip.z + rightHip.z) / 2,
+    };
+
+    const torsoCenter = {
+      x: (shoulderCenter.x + hipCenter.x) / 2,
+      y: shoulderCenter.y + (hipCenter.y - shoulderCenter.y) * 0.2, // Position closer to shoulders
+      z: (shoulderCenter.z + hipCenter.z) / 2 - 0.1, // Approx depth, slightly forward
+    };
+
+    const world = uvToWorld(torsoCenter.x, torsoCenter.y, torsoCenter.z);
+
+    // --- Scale Calculation ---
+    // Scale: Based on shoulder width and torso height
+    const shoulderDist = Math.sqrt(Math.pow(rightShoulder.x - leftShoulder.x, 2) + Math.pow(rightShoulder.y - leftShoulder.y, 2));
+    const torsoHeight = Math.abs(shoulderCenter.y - hipCenter.y);
+    const scale = Math.max(shoulderDist * 4, torsoHeight * 1.8);
+
+    // --- Rotation Calculation ---
+    // Rotation: Align with shoulders
+    const shoulderAngle = Math.atan2(shoulderVec.z, shoulderVec.x);
+    // Add Math.PI to correct the initial 180-degree rotation of the model.
+    const targetYaw = shoulderAngle + Math.PI;
+
+    // --- Smoothing ---
+    let alignment = {
+      position: { x: world.x, y: world.y, z: world.z },
+      rotation: { pitch: 0, yaw: targetYaw, roll: 0 }, // Using yaw to align horizontally
+      scale,
+      visible: true,
+    };
+
+    if (lastTShirtAlignment) {
+      alignment.position.x = THREE.MathUtils.lerp(lastTShirtAlignment.position.x, alignment.position.x, SMOOTHING.position);
+      alignment.position.y = THREE.MathUtils.lerp(lastTShirtAlignment.position.y, alignment.position.y, SMOOTHING.position);
+      alignment.position.z = THREE.MathUtils.lerp(lastTShirtAlignment.position.z, alignment.position.z, SMOOTHING.position);
+      alignment.scale = THREE.MathUtils.lerp(lastTShirtAlignment.scale, alignment.scale, SMOOTHING.scale);
+      // Use our custom lerpShortestAngle for smooth rotation that handles wrapping around PI/-PI
+      alignment.rotation.yaw = lerpShortestAngle(lastTShirtAlignment.rotation.yaw, targetYaw, SMOOTHING.rotation);
+    }
+
+    lastTShirtAlignment = { ...alignment };
+    return alignment;
+  },
+};
+
+export default function FaceMeshViewer({ accessory, setDebugInfo, setIsAccessoryLoaded, setIsModelLoaded, setStatus }) {
+  const videoRef = useRef(null);
+  const threeContainerRef = useRef(null);
+  const animationRef = useRef(null);
+  const sceneRef = useRef(null);
+  const rendererRef = useRef(null);
+  const cameraRef = useRef(null);
+  const accessoryRef = useRef(null);
+  const accessoryInstancesRef = useRef([]);
+  const faceOccluderRef = useRef(null);
+  const currentAccessoryRef = useRef(null);
+  const holisticRef = useRef(null);
+  const cameraUtilRef = useRef(null);
   const [isSceneReady, setIsSceneReady] = useState(false);
 
-  // This effect hook handles loading and changing the glasses model
+  // Update accessory ref when prop changes
   useEffect(() => {
-    if (!isSceneReady || !glassesModelPath) return;
+    currentAccessoryRef.current = accessory;
+    console.log("🎯 Accessory changed to:", accessory?.type, accessory?.name);
+  }, [accessory]);
 
-    async function loadGlassesModel(path) {
+  // Accessory loading effect (same structure as your original)
+  useEffect(() => {
+    if (!isSceneReady || !accessory?.path) return;
+
+    async function loadAccessoryModel(accessoryConfig) {
       try {
-        // Remove the previous glasses model if it exists
-        if (glassesRef.current && sceneRef.current) {
-          sceneRef.current.remove(glassesRef.current);
-          glassesRef.current = null;
-        }
-        setIsGlassesLoaded(false);
-        setStatus(`Loading glasses model: ${path.split('/').pop()}`);
+        cleanupAccessories();
+
+        setIsAccessoryLoaded(false);
+        setStatus(`Loading ${accessoryConfig.name}...`);
 
         const { GLTFLoader } = await import("three/examples/jsm/loaders/GLTFLoader.js");
         const loader = new GLTFLoader();
 
         loader.load(
-          path,
+          accessoryConfig.path,
           (gltf) => {
-            console.log(`Glasses model loaded from ${path}`);
-            const glasses = gltf.scene;
+            console.log(`Accessory loaded: ${accessoryConfig.name} (${accessoryConfig.type})`);
 
-            glasses.traverse((child) => {
-              if (child.isMesh) {
-                child.material.depthTest = true;
-                child.material.depthWrite = true;
+            const needsMultipleInstances = accessoryConfig.type === ACCESSORY_TYPES.EARRINGS;
+
+            if (needsMultipleInstances) {
+              for (let i = 0; i < 2; i++) {
+                const instance = gltf.scene.clone();
+                setupAccessoryMesh(instance);
+                sceneRef.current.add(instance);
+                accessoryInstancesRef.current.push(instance);
               }
-            });
+            } else {
+              const model = gltf.scene;
+              setupAccessoryMesh(model);
+              sceneRef.current.add(model);
+              accessoryRef.current = model;
+            }
 
-            glasses.scale.set(0.1, 0.1, 0.1);
-            glasses.position.set(0, 0, 0);
-            glasses.visible = true;
-            glasses.renderOrder = 0; // Render after occluder
-
-            sceneRef.current.add(glasses);
-            glassesRef.current = glasses;
-            setIsGlassesLoaded(true);
-            setStatus("Glasses model loaded successfully!");
+            setIsAccessoryLoaded(true);
+            setStatus(`${accessoryConfig.name} loaded successfully!`);
           },
           (progress) => {
-            const percent = ((progress.loaded / progress.total) * 100).toFixed(0);
-            setStatus(`Loading glasses... ${percent}%`);
+            const percent = progress.total ? ((progress.loaded / progress.total) * 100).toFixed(0) : "-";
+            setStatus(`Loading ${accessoryConfig.name}... ${percent}%`);
           },
           (error) => {
-            console.error(`Error loading glasses model from ${path}:`, error);
-            setStatus("Failed to load glasses model");
-            createFallbackCube();
+            console.error(`Error loading ${accessoryConfig.name}:`, error);
+            setStatus(`Failed to load ${accessoryConfig.name}`);
+            createFallbackModel(accessoryConfig.type);
           }
         );
       } catch (err) {
-        console.error("Error setting up glasses loader:", err);
-        createFallbackCube();
+        console.error("Error setting up accessory loader:", err);
+        createFallbackModel(accessoryConfig.type);
+      }
+    }
+
+    loadAccessoryModel(accessory);
+  }, [accessory, isSceneReady]);
+
+  function setupAccessoryMesh(mesh) {
+    mesh.traverse((child) => {
+      if (child.isMesh) {
+        child.material.depthTest = true;
+        child.material.depthWrite = true;
+      }
+    });
+    mesh.scale.set(0.1, 0.1, 0.1);
+    mesh.position.set(0, 0, 0);
+    mesh.visible = false;
+    mesh.renderOrder = 0;
+  }
+
+  function cleanupAccessories() {
+    if (accessoryRef.current && sceneRef.current) {
+      sceneRef.current.remove(accessoryRef.current);
+      accessoryRef.current = null;
+    }
+
+    if (accessoryInstancesRef.current.length > 0) {
+      accessoryInstancesRef.current.forEach((instance) => {
+        if (sceneRef.current) sceneRef.current.remove(instance);
+      });
+      accessoryInstancesRef.current = [];
+    }
+  }
+
+  function createFallbackModel(type) {
+    if (!sceneRef.current) return;
+
+    console.log(`Creating fallback model for ${type}`);
+    const geometry = new THREE.BoxGeometry(0.08, 0.08, 0.08);
+    const material = new THREE.MeshBasicMaterial({
+      color: type === ACCESSORY_TYPES.EARRINGS ? 0xffd700 : 0x00ff00,
+      wireframe: false,
+      transparent: true,
+      opacity: 0.8,
+    });
+
+    if (type === ACCESSORY_TYPES.EARRINGS) {
+      for (let i = 0; i < 2; i++) {
+        const cube = new THREE.Mesh(geometry, material);
+        cube.position.set(i === 0 ? -0.2 : 0.2, 0, -0.3);
+        cube.visible = true;
+        cube.renderOrder = 1;
+        sceneRef.current.add(cube);
+        accessoryInstancesRef.current.push(cube);
+      }
+    } else {
+      const cube = new THREE.Mesh(geometry, material);
+      cube.position.set(0, 0, -0.3);
+      cube.visible = true;
+      cube.renderOrder = 1;
+      sceneRef.current.add(cube);
+      accessoryRef.current = cube;
+    }
+
+    setIsAccessoryLoaded(true);
+    setStatus(`Using DEBUG MODE for ${type}`);
+  }
+
+  // Main initialization effect
+  useEffect(() => {
+    let running = true;
+
+    async function initCameraElement() {
+      try {
+        setStatus("Requesting camera access...");
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: VIDEO_WIDTH, height: VIDEO_HEIGHT, facingMode: "user" },
+          audio: false,
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          return new Promise((resolve) => {
+            videoRef.current.onloadedmetadata = () => {
+              setStatus("Camera ready");
+              resolve();
+            };
+          });
+        }
+      } catch (err) {
+        console.error("Camera access denied:", err);
+        setStatus("Camera access denied");
         throw err;
       }
     }
 
-    loadGlassesModel(glassesModelPath);
+    async function initThreeJS() {
+      try {
+        setStatus("Initializing 3D scene...");
 
-  }, [glassesModelPath, isSceneReady]);
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(50, VIDEO_WIDTH / VIDEO_HEIGHT, 0.01, 100);
+        const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, stencil: true });
 
+        renderer.setSize(VIDEO_WIDTH, VIDEO_HEIGHT);
+        renderer.setClearColor(0x000000, 0);
+        renderer.domElement.style.position = "absolute";
+        renderer.domElement.style.top = "0";
+        renderer.domElement.style.left = "0";
+        renderer.domElement.style.pointerEvents = "none";
+        renderer.sortObjects = true;
 
-  useEffect(() => {
-    let isRunning = true;
+        if (threeContainerRef.current) {
+          threeContainerRef.current.appendChild(renderer.domElement);
+        }
 
-    async function initCamera() {
-      try {
-        setStatus("Requesting camera access...");
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: VIDEO_WIDTH,
-            height: VIDEO_HEIGHT,
-            facingMode: "user",
-          },
-          audio: false,
-        });
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+        scene.add(ambientLight);
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          return new Promise((resolve) => {
-            videoRef.current.onloadedmetadata = () => {
-              setStatus("Camera ready");
-              resolve();
-            };
-          });
-        }
-      } catch (err) {
-        console.error("Camera access denied:", err);
-        setStatus("Camera access denied");
-        throw err;
-      }
-    }
+        const keyLight = new THREE.DirectionalLight(0xffffff, 2.0);
+        keyLight.position.set(0, 0, 1);
+        keyLight.target.position.set(0, 0, 0);
+        scene.add(keyLight);
+        scene.add(keyLight.target);
 
-    async function initThreeJS() {
-      try {
-        setStatus("Initializing 3D scene...");
+        const keyLight1 = new THREE.DirectionalLight(0xffffff, 5.0);
+        keyLight1.position.set(0, 0, 0);
+        keyLight1.target.position.set(0, 0, 0);
+        scene.add(keyLight1);
+        scene.add(keyLight1.target);
 
-        const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(50,VIDEO_WIDTH / VIDEO_HEIGHT,0.01,100);
-        const renderer = new THREE.WebGLRenderer({alpha: true,antialias: true,stencil: true});
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        fillLight.position.set(-0.5, 0.5, 1);
+        fillLight.target.position.set(0, 0, 0);
+        scene.add(fillLight);
+        scene.add(fillLight.target);
 
-        renderer.setSize(VIDEO_WIDTH, VIDEO_HEIGHT);
-        renderer.setClearColor(0x000000, 0);
-        renderer.domElement.style.position = "absolute";
-        renderer.domElement.style.top = "0";
-        renderer.domElement.style.left = "0";
-        renderer.domElement.style.pointerEvents = "none";
-        renderer.sortObjects = true;
-        renderer.shadowMap.enabled = false;
+        camera.position.set(0, 0, 1);
+        camera.lookAt(0, 0, 0);
 
-        if (threeContainerRef.current) {
-          threeContainerRef.current.appendChild(renderer.domElement);
-        }
+        sceneRef.current = scene;
+        rendererRef.current = renderer;
+        cameraRef.current = camera;
+        setIsSceneReady(true);
 
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
-        scene.add(ambientLight);
-        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.6);
-        directionalLight.position.set(0, 1, 0.5);
-        scene.add(directionalLight);
+        setStatus("3D scene initialized");
+        return { scene, camera, renderer };
+      } catch (err) {
+        console.error("Three.js initialization error:", err);
+        setStatus("3D initialization failed");
+        throw err;
+      }
+    }
 
-        camera.position.set(0, 0, 1);
-        camera.lookAt(0, 0, 0);
+    function createFaceOccluder() {
+      if (!sceneRef.current) return;
 
-        sceneRef.current = scene;
-        rendererRef.current = renderer;
-        cameraRef.current = camera;
-        setIsSceneReady(true); // Signal that the scene is ready for models to be loaded
+      const occluderGeometry = new THREE.BufferGeometry();
+      const occluderMaterial = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        depthWrite: true,
+        depthTest: true,
+        colorWrite: false,
+        side: THREE.DoubleSide,
+        opacity: 0,
+      });
 
-        setStatus("3D scene initialized");
-        return { scene, camera, renderer };
-      } catch (err) {
-        console.error("Three.js initialization error:", err);
-        setStatus("3D initialization failed");
-        throw err;
-      }
-    }
+      const occluder = new THREE.Mesh(occluderGeometry, occluderMaterial);
+      occluder.renderOrder = -1;
+      occluder.visible = false;
 
-    function createRealisticFaceOccluder() {
-      if (!sceneRef.current) return;
-      console.log("Creating realistic face occluder mesh");
-      const occluderGeometry = new THREE.BufferGeometry();
-      const occluderMaterial = new THREE.MeshBasicMaterial({
-        color: 0x000000,
-        depthWrite: true,
-        depthTest: true,  
-        colorWrite: false, 
-        side: THREE.DoubleSide,
-        opacity: 0  
-      });
+      sceneRef.current.add(occluder);
+      faceOccluderRef.current = occluder;
+    }
 
-      const occluder = new THREE.Mesh(occluderGeometry, occluderMaterial);
-      occluder.renderOrder = -1;
-      occluder.visible = false;
+    function updateFaceOccluderFromFaceLandmarks(facePoints) {
+      if (!faceOccluderRef.current || !facePoints || facePoints.length < 468) {
+        if (faceOccluderRef.current) faceOccluderRef.current.visible = false;
+        return;
+      }
 
-      sceneRef.current.add(occluder);
-      faceOccluderRef.current = occluder;
-      console.log("Realistic face occluder created");
-    }
+      try {
+        const vertices = [];
+        for (let i = 0; i < facePoints.length; i++) {
+          const lm = facePoints[i];
+          const worldPos = uvToWorld(lm.x / VIDEO_WIDTH, lm.y / VIDEO_HEIGHT, -0.15);
+          vertices.push(worldPos.x, worldPos.y, worldPos.z);
+        }
 
-    function updateRealisticFaceOccluder(landmarks) {
-      if (!faceOccluderRef.current || !landmarks || landmarks.length < 468) {
-        if (faceOccluderRef.current) faceOccluderRef.current.visible = false;
-        return;
-      }
-      try {
-        const occluderIndices = [
-          ...FACE_OCCLUDER_LANDMARKS.faceContour,
-          ...FACE_OCCLUDER_LANDMARKS.leftEye,
-          ...FACE_OCCLUDER_LANDMARKS.rightEye,
-          ...FACE_OCCLUDER_LANDMARKS.nose,
-          ...FACE_OCCLUDER_LANDMARKS.forehead
-        ];
-        const uniqueIndices = [...new Set(occluderIndices)];
-        const vertices = [];
-        const validLandmarks = [];
+        const geometry = faceOccluderRef.current.geometry;
+        geometry.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
 
-        uniqueIndices.forEach(idx => {
-          if (landmarks[idx]) {
-            const landmark = landmarks[idx];
-            const worldPos = uvToWorld(
-              landmark.x / VIDEO_WIDTH,
-              landmark.y / VIDEO_HEIGHT,
-              -0.15
-            );
-            vertices.push(worldPos.x, worldPos.y, worldPos.z);
-            validLandmarks.push(landmark);
-          }
-        });
-        if (vertices.length < 9) {
-          faceOccluderRef.current.visible = false;
-          return;
-        }
-        const occluder = faceOccluderRef.current;
-        const geometry = occluder.geometry;
-        geometry.setAttribute("position",new THREE.Float32BufferAttribute(vertices, 3));
-        const triangles = [];
-        const numPoints = vertices.length / 3;
-        const centerIdx = Math.floor(numPoints / 2);
-        for (let i = 0; i < numPoints; i++) {
-          if (i !== centerIdx) {
-            const next = (i + 1) % numPoints;
-            if (next !== centerIdx) {
-              triangles.push(centerIdx, i, next);
-            }
-          }
-        }
-        for (let i = 0; i < Math.min(numPoints - 2, 20); i++) {
-          triangles.push(i, i + 1, i + 2);
-        }
-        geometry.setIndex(triangles);
-        geometry.computeVertexNormals();
-        occluder.visible = true;
-        // console.log(`Face occluder updated with ${numPoints} points, ${triangles.length/3} triangles`);
-      } catch (error) {
-        console.warn("Failed to update realistic face occluder:", error);
-        if (faceOccluderRef.current) faceOccluderRef.current.visible = false;
-      }
-    }
+        // FACEMESH_TRIANGULATION is an array of indices; ensure it's flat indices
+        const indices = FACEMESH_TRIANGULATION.flat ? FACEMESH_TRIANGULATION.flat() : FACEMESH_TRIANGULATION;
+        geometry.setIndex(indices);
+        geometry.computeVertexNormals();
 
-    function createFallbackCube() {
-      if (!sceneRef.current) return;
-      console.log("Creating fallback debugging cube");
-      const geometry = new THREE.BoxGeometry(0.1, 0.1, 0.1);
-      geometry.computeBoundingSphere();
-      geometry.computeBoundingBox();
-      const material = new THREE.MeshBasicMaterial({color: 0x00ff00,wireframe: false,transparent: true,opacity: 0.8});
-      const cube = new THREE.Mesh(geometry, material);
-      cube.position.set(0, 0, -0.3);
-      cube.visible = true;
-      cube.renderOrder = 1;
-      sceneRef.current.add(cube);
-      glassesRef.current = cube;
-      setIsGlassesLoaded(true);
-      setStatus("Using DEBUG CUBE with realistic face occlusion");
-      console.log("Debug cube created at position:", cube.position);
-    }
+        faceOccluderRef.current.visible = true;
+      } catch (error) {
+        console.warn("Failed to update face occluder:", error);
+        if (faceOccluderRef.current) faceOccluderRef.current.visible = false;
+      }
+    }
 
-    async function loadFaceMeshModel() {
-      try {
-        setStatus("Loading TensorFlow...");
-        await tf.ready();
-        console.log("TensorFlow ready");
-        setStatus("Loading MediaPipe FaceMesh model...");
-        const model = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
-        const detectorConfig = {runtime: "tfjs",maxFaces: 1,refineLandmarks: true};
-        const detector = await faceLandmarksDetection.createDetector(model,detectorConfig);
-        detectorRef.current = detector;
-        setIsModelLoaded(true);
-        setStatus("MediaPipe FaceMesh loaded successfully!");
-        console.log("MediaPipe FaceMesh model loaded successfully");
-        return detector;
-      } catch (err) {
-        console.error("Error loading MediaPipe model:", err);
-        setStatus("Model loading failed, using simulation");
-        setIsModelLoaded(false);
-        return null;
-      }
-    }
+    function uvToWorld(u, v, planeZ = 0) {
+      const cam = cameraRef.current;
+      const ndc = new THREE.Vector3(u * 2 - 1, 1 - v * 2, 0.5);
+      ndc.unproject(cam);
+      const dir = ndc.sub(cam.position).normalize();
+      const t = (planeZ - cam.position.z) / dir.z;
+      return cam.position.clone().add(dir.multiplyScalar(t));
+    }
 
-    function uvToWorld(u, v, planeZ = 0) {
-      const cam = cameraRef.current;
-      const ndc = new THREE.Vector3(u * 2 - 1, 1 - v * 2, 0.5);
-      ndc.unproject(cam);
-      const dir = ndc.sub(cam.position).normalize();
-      const t = (planeZ - cam.position.z) / dir.z;
-      return cam.position.clone().add(dir.multiplyScalar(t));
-    }
+    function updateAccessoryAlignment(alignment) {
+      if (!alignment || !alignment.visible) {
+        hideAllAccessories();
+        return;
+      }
 
-    function getFaceAlignment(landmarks) {
-      try {
-        const leftEyeCenter = landmarks[159];
-        const rightEyeCenter = landmarks[386];
-        const noseTip = landmarks[1];
-        const glassesCenter = {x: (leftEyeCenter.x + rightEyeCenter.x) / 2,y: (leftEyeCenter.y + rightEyeCenter.y) / 2 + 0.01,z: (leftEyeCenter.z + rightEyeCenter.z) / 2 - 0.05,};
-        const normalizedGlassesCenter = {x: glassesCenter.x / VIDEO_WIDTH,y: glassesCenter.y / VIDEO_HEIGHT - 0.02,z: glassesCenter.z / VIDEO_WIDTH};
-        const u = normalizedGlassesCenter.x;
-        const v = normalizedGlassesCenter.y;
-        const targetZ = -0.1;
-        const world = uvToWorld(u, v, targetZ);
-        const position = { x: world.x, y: world.y, z: world.z };
-        const eyeDistancePixels = Math.sqrt(Math.pow(rightEyeCenter.x - leftEyeCenter.x, 2) + Math.pow(rightEyeCenter.y - leftEyeCenter.y, 2) + Math.pow(rightEyeCenter.z - leftEyeCenter.z, 2));
-        const eyeDistanceNormalized = eyeDistancePixels / VIDEO_WIDTH;
-        const scale = Math.max(0.5, Math.min(4.0, eyeDistanceNormalized * 20));
-        const eyeVectorPixels = {x: rightEyeCenter.x - leftEyeCenter.x,y: rightEyeCenter.y - leftEyeCenter.y,};
-        const roll = -Math.atan2(eyeVectorPixels.y, eyeVectorPixels.x);
-        const eyeMidpointPixels = {x: (leftEyeCenter.x + rightEyeCenter.x) / 2,y: (leftEyeCenter.y + rightEyeCenter.y) / 2};
-        const noseOffsetPixels = noseTip.x - eyeMidpointPixels.x;
-        const yaw = Math.atan2(noseOffsetPixels, eyeDistancePixels) * 0.8;
-        const noseOffsetY = noseTip.y - eyeMidpointPixels.y;
-        const pitch = Math.atan2(noseOffsetY, eyeDistancePixels * 0.8) - 0.8;
-        return {position,rotation: { pitch, yaw, roll },scale};
-      } catch (err) {
-        console.error("Error calculating face alignment:", err);
-        return {position: { x: 0, y: 0, z: -0.3 },rotation: { pitch: 0, yaw: 0, roll: 0 },scale: 1};
-      }
-    }
+      if (alignment.isMultiple && accessoryInstancesRef.current.length > 0) {
+        alignment.positions.forEach((pos, index) => {
+          if (accessoryInstancesRef.current[index]) {
+            const instance = accessoryInstancesRef.current[index];
+            instance.visible = true;
+            instance.position.set(pos.x, pos.y, pos.z);
+            instance.rotation.x = alignment.rotation.pitch;
+            instance.rotation.y = alignment.rotation.yaw;
+            instance.rotation.z = alignment.rotation.roll;
 
-    function updateGlassesAlignment(alignment) {
-      if (!glassesRef.current) return;
-      const { position, rotation, scale } = alignment;
-      glassesRef.current.visible = true;
-      glassesRef.current.position.set(position.x, position.y, position.z);
-      glassesRef.current.rotation.x = rotation.pitch;
-      glassesRef.current.rotation.y = rotation.yaw;
-      glassesRef.current.rotation.z = rotation.roll;
-      const clampedScale = Math.max(0.1, Math.min(4.0, scale));
-      glassesRef.current.scale.setScalar(clampedScale);
-      glassesRef.current.updateMatrix();
-      glassesRef.current.updateMatrixWorld(true);
-      setDebugInfo(`Pos: (${position.x.toFixed(2)}, ${position.y.toFixed(2)}, ${position.z.toFixed(2)}) Scale: ${clampedScale.toFixed(2)}`);
-      if (rendererRef.current && sceneRef.current && cameraRef.current) {
-        rendererRef.current.clear(false, true, false);
-        rendererRef.current.render(sceneRef.current, cameraRef.current);
-      }
-    }
+            const clampedScale = Math.max(0.1, Math.min(4.0, alignment.scale));
+            instance.scale.setScalar(clampedScale);
+            instance.updateMatrix();
+            instance.updateMatrixWorld(true);
+          }
+        });
 
-    function getSimulatedAlignment() {
-      const time = Date.now() * 0.001;
-      return {
-        position: { x: 0, y: 0, z: -0.3 },
-        rotation: {pitch: Math.sin(time * 0.7) * 0.1,yaw: Math.sin(time * 0.5) * 0.2,roll: Math.sin(time * 0.3) * 0.1},
-        scale: 1.0,
-      };
-    }
+        setDebugInfo(
+          `Earrings - L:(${alignment.positions[0].x.toFixed(2)},${alignment.positions[0].y.toFixed(2)}) Scale:${alignment.scale.toFixed(2)}`
+        );
+      } else if (accessoryRef.current) {
+        const { position, rotation, scale } = alignment;
+        accessoryRef.current.visible = true;
+        accessoryRef.current.position.set(position.x, position.y, position.z);
+        accessoryRef.current.rotation.x = rotation.pitch;
+        accessoryRef.current.rotation.y = rotation.yaw;
+        accessoryRef.current.rotation.z = rotation.roll;
 
-    async function detectLoop() {
-      if (!isRunning) return;
-      let alignment = {position: { x: 0, y: 0, z: -0.3 },rotation: { pitch: 0, yaw: 0, roll: 0 },scale: 1.0};
-      try {
-        if (detectorRef.current && videoRef.current && videoRef.current.readyState === 4) {
-          const predictions = await detectorRef.current.estimateFaces(videoRef.current,{flipHorizontal: false});
-          if (predictions.length > 0) {
-            const face = predictions[0];
-            if (face.keypoints && face.keypoints.length > 400) {
-              alignment = getFaceAlignment(face.keypoints);
-              updateRealisticFaceOccluder(face.keypoints);
-              // setStatus(`🎧 Headphones aligned! Tracking ${predictions.length} face(s)`);
-            }
-          } else {
-            setStatus("👋 No face detected - show your face to the camera");
-            if (faceOccluderRef.current) faceOccluderRef.current.visible = false;
-            alignment = {position: { x: 0, y: 0, z: -0.3 },rotation: { pitch: 0, yaw: 0, roll: 0 },scale: 2.5};
-          }
-        } else {
-          alignment = getSimulatedAlignment();
-          if (!detectorRef.current) setStatus("🤖 Simulation mode (model not loaded)");
-        }
-      } catch (err) {
-        console.error("Detection error:", err);
-        alignment = getSimulatedAlignment();
-        setStatus("⚠️ Detection error - using simulation");
-      }
-      updateGlassesAlignment(alignment);
-      animationRef.current = requestAnimationFrame(detectLoop);
-    }
+        const clampedScale = Math.max(0.1, Math.min(4.0, scale));
+        accessoryRef.current.scale.setScalar(clampedScale);
+        accessoryRef.current.updateMatrix();
+        accessoryRef.current.updateMatrixWorld(true);
 
-    async function init() {
-      try {
-        await initCamera();
-        await initThreeJS();
-        createRealisticFaceOccluder();
-        // The glasses model loading is now handled by the useEffect hook watching `glassesModelPath`
-        detectLoop();
-        await loadFaceMeshModel();
-        if (videoRef.current && videoRef.current.readyState < 4) {
-          await videoRef.current.play();
-        }
-        console.log("Initialization complete");
-      } catch (err) {
-        console.error("Initialization error:", err);
-        setStatus("Initialization failed");
-      }
-    }
+        setDebugInfo(
+          `Pos:(${position.x.toFixed(2)},${position.y.toFixed(2)},${position.z.toFixed(2)}) Scale:${clampedScale.toFixed(
+            2
+          )}`
+        );
+      }
 
-    init();
+      if (rendererRef.current && sceneRef.current && cameraRef.current) {
+        rendererRef.current.clear(false, true, false);
+        rendererRef.current.render(sceneRef.current, cameraRef.current);
+      }
+    }
 
-    return () => {
-      isRunning = false;
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-      if (videoRef.current?.srcObject) videoRef.current.srcObject.getTracks().forEach((track) => track.stop());
-      if (rendererRef.current) rendererRef.current.dispose();
-      if (faceOccluderRef.current?.geometry) faceOccluderRef.current.geometry.dispose();
-      if (faceOccluderRef.current?.material) faceOccluderRef.current.material.dispose();
-    };
-  }, []);
+    function hideAllAccessories() {
+      if (accessoryRef.current) accessoryRef.current.visible = false;
+      accessoryInstancesRef.current.forEach((instance) => (instance.visible = false));
+    }
 
-  return (
-    <div style={{position: "relative",width: VIDEO_WIDTH,height: VIDEO_HEIGHT,backgroundColor: "#000",borderRadius: "16px",overflow: "hidden"}}>
-      <video ref={videoRef} width={VIDEO_WIDTH} height={VIDEO_HEIGHT} style={{position: "absolute",top: 0,left: 0,zIndex: 0,transform: "scaleX(1)",objectFit: "cover"}} autoPlay muted playsInline/>
-      <div ref={threeContainerRef} style={{position: "absolute",top: 0,left: 0,zIndex: 1,pointerEvents: "none"}}/>
-    </div>
-  );
+    // Holistic onResults callback
+    function onHolisticResults(results) {
+      if (!running) return;
+
+      // Convert landmarks into pixel-space points similar to your previous detector output
+      const facePoints = results.faceLandmarks ? convertFaceLandmarksToPixelPoints(results.faceLandmarks) : null;
+      const posePoints = results.poseLandmarks ? convertPoseLandmarksToPixelPoints(results.poseLandmarks) : null;
+
+      // update occluder
+      if (facePoints) updateFaceOccluderFromFaceLandmarks(facePoints);
+
+      // determine alignment strategy based on current accessory
+      const currentAccessory = currentAccessoryRef.current;
+      const strategy = AccessoryAlignmentStrategies[currentAccessory?.type];
+
+      let alignment = null;
+      try {
+        if (strategy) {
+          // Necklace strategy needs raw normalized pose landmarks
+          if (currentAccessory?.type === ACCESSORY_TYPES.NECKLACE || currentAccessory?.type === ACCESSORY_TYPES.T_SHIRT) {
+            alignment = strategy(results.poseLandmarks, uvToWorld);
+          } else {
+            alignment = strategy(facePoints, uvToWorld); // Other strategies use pixel-space points
+          }
+        } else {
+          // no strategy for current accessory — hide accessories
+          console.warn("No alignment strategy for", currentAccessory?.type);
+        }
+      } catch (err) {
+        console.error("Alignment strategy error:", err);
+      }
+
+      if (alignment && alignment.visible) {
+        setStatus(`✅ Tracking face - ${currentAccessory?.name || "accessory"} aligned`);
+      } else {
+        setStatus("👋 No face/pose detected or accessory not visible");
+      }
+
+      updateAccessoryAlignment(alignment);
+    }
+
+    async function initHolistic() {
+      try {
+        setStatus("Loading MediaPipe Holistic...");
+        const holistic = new Holistic({
+          locateFile: (file) => {
+            // default CDN path (you can adjust if you host assets locally)
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`;
+          },
+        });
+
+        holistic.setOptions({
+          modelComplexity: 1,
+          smoothLandmarks: true,
+          refineFaceLandmarks: true,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+        });
+
+        holistic.onResults(onHolisticResults);
+        holisticRef.current = holistic;
+        setIsModelLoaded(true);
+        setStatus("Holistic ready");
+      } catch (err) {
+        console.error("Holistic init error:", err);
+        setStatus("Holistic initialization failed");
+        setIsModelLoaded(false);
+      }
+    }
+
+    // Start camera feed using MediaPipe Camera util which will call holistic.send({image: video})
+    async function startCameraSendingToHolistic() {
+      if (!videoRef.current) return;
+
+      try {
+        cameraUtilRef.current = new Camera(videoRef.current, {
+          onFrame: async () => {
+            if (holisticRef.current) {
+              await holisticRef.current.send({ image: videoRef.current });
+            }
+          },
+          width: VIDEO_WIDTH,
+          height: VIDEO_HEIGHT,
+        });
+        cameraUtilRef.current.start();
+      } catch (err) {
+        console.warn("Camera util failed; falling back to manual capture:", err);
+        // fallback: use a requestAnimationFrame loop to send frames
+        const fallbackLoop = async () => {
+          if (!running) return;
+          if (holisticRef.current && videoRef.current && videoRef.current.readyState >= 2) {
+            try {
+              await holisticRef.current.send({ image: videoRef.current });
+            } catch (e) {
+              // ignore
+            }
+          }
+          requestAnimationFrame(fallbackLoop);
+        };
+        fallbackLoop();
+      }
+    }
+
+    // Simple render loop to continuously render Three scene for smoother visuals
+    function renderLoop() {
+      if (!running) return;
+      if (rendererRef.current && sceneRef.current && cameraRef.current) {
+        rendererRef.current.render(sceneRef.current, cameraRef.current);
+      }
+      animationRef.current = requestAnimationFrame(renderLoop);
+    }
+
+    async function initAll() {
+      try {
+        await initCameraElement();
+        await initThreeJS();
+        createFaceOccluder();
+        await initHolistic();
+        await startCameraSendingToHolistic();
+
+        // Ensure video plays
+        if (videoRef.current && videoRef.current.readyState < 4) {
+          await videoRef.current.play().catch(() => {});
+        }
+
+        renderLoop();
+
+        console.log("Initialization complete");
+      } catch (err) {
+        console.error("Initialization error:", err);
+        setStatus("Initialization failed");
+      }
+    }
+
+    initAll();
+
+    return () => {
+      running = false;
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      if (cameraUtilRef.current && cameraUtilRef.current.stop) {
+        try {
+          cameraUtilRef.current.stop();
+        } catch (e) {}
+      }
+      if (videoRef.current?.srcObject) {
+        try {
+          videoRef.current.srcObject.getTracks().forEach((t) => t.stop());
+        } catch (e) {}
+      }
+      if (holisticRef.current) {
+        try {
+          holisticRef.current.close();
+        } catch (e) {}
+      }
+      if (rendererRef.current) rendererRef.current.dispose();
+      if (faceOccluderRef.current?.geometry) faceOccluderRef.current.geometry.dispose();
+      if (faceOccluderRef.current?.material) faceOccluderRef.current.material.dispose();
+      cleanupAccessories();
+    };
+  }, []);
+
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: VIDEO_WIDTH,
+        height: VIDEO_HEIGHT,
+        backgroundColor: "#000",
+        borderRadius: "16px",
+        overflow: "hidden",
+        boxShadow: "0 10px 40px rgba(0,0,0,0.5)",
+      }}
+    >
+      <video
+        ref={videoRef}
+        width={VIDEO_WIDTH}
+        height={VIDEO_HEIGHT}
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          zIndex: 0,
+          transform: "scaleX(1)",
+          objectFit: "cover",
+        }}
+        autoPlay
+        muted
+        playsInline
+      />
+      <div
+        ref={threeContainerRef}
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          zIndex: 1,
+          pointerEvents: "none",
+        }}
+      />
+    </div>
+  );
 }
