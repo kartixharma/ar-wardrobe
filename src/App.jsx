@@ -21,9 +21,14 @@ const ACCESSORIES = [
   // Earrings
   { id: 'sapphire', name: "Sapphire", path: "/models/sapphire_earring.glb", type: ACCESSORY_TYPES.EARRINGS, category: "Earrings" },
   { id: 'golden', name: "Golden", path: "/models/golden_earring.glb", type: ACCESSORY_TYPES.EARRINGS, category: "Earrings" },
+  { id: 'louboutin', name: "Louboutin ", path: "/models/earrings2.glb", type: ACCESSORY_TYPES.EARRINGS, category: "Earrings" },
+  { id: 'amesthys', name: "Amesthys  ", path: "/models/earrings3.glb", type: ACCESSORY_TYPES.EARRINGS, category: "Earrings" },
+  { id: 'jhumka', name: "Jhumka  ", path: "/models/earrings4.glb", type: ACCESSORY_TYPES.EARRINGS, category: "Earrings" },
 
   // Necklaces
   { id: 'pearl-necklace', name: "Pearls", path: "/models/gemstone_necklace.glb", type: ACCESSORY_TYPES.NECKLACE, category: "Necklaces" },
+  { id: 'elegant-jewel', name: "Elegant Jewel", path: "/models/necklace2.glb", type: ACCESSORY_TYPES.NECKLACE, category: "Necklaces" },
+  { id: 'orbit-pendant', name: "Orbit Pendant", path: "/models/necklace3.glb", type: ACCESSORY_TYPES.NECKLACE, category: "Necklaces" },
 
   // T-Shirts
   { id: 'classic-tshirt', name: "Classic Tee", path: "/models/tshirt_with_etecet.glb", type: ACCESSORY_TYPES.T_SHIRT, category: "T-Shirts" },

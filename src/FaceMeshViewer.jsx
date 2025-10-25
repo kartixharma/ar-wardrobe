@@ -512,6 +512,12 @@ export default function FaceMeshViewer({ accessory, setDebugInfo, setIsAccessory
         scene.add(keyLight1);
         scene.add(keyLight1.target);
 
+        const keyLight2 = new THREE.DirectionalLight(0xffffff, 7.0);
+        keyLight2.position.set(-0.5, 0.5, 1);
+        keyLight2.target.position.set(0, 0, 0);
+        scene.add(keyLight2);
+        scene.add(keyLight2.target);
+
         const fillLight = new THREE.DirectionalLight(0xffffff, 0.5);
         fillLight.position.set(-0.5, 0.5, 1);
         fillLight.target.position.set(0, 0, 0);
